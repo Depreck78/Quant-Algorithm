@@ -1,0 +1,121 @@
+#region imports
+from AlgorithmImports import *
+#endregion
+
+class CreativeRedHornet(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2019, 1, 1)
+        #self.SetEndDate(2024, 6, 12)
+        self.SetCash(100000)
+        
+        self.Settings.FreePortfolioValuePercentage = 0.05
+        self.positionSizeUSD = 3500
+        self.momentum_entry = 60
+        self.oversold_entry = 20
+        self.momentum_exit = 40
+        self.overbought_exit = 80
+        self.minimumVolume = 50000  # Lowering volume constraint
+        
+        # Add data for all tickers
+        universe = ['BTCUSD', 'LTCUSD', 'ETHUSD', 'ETCUSD', 'RRTUSD', 'ZECUSD', 'XMRUSD', 'XRPUSD', 'EOSUSD', 
+                    'SANUSD', 'OMGUSD', 'NEOUSD', 'ETPUSD', 'BTGUSD', 'SNTUSD', 'BATUSD', 'FUNUSD', 'ZRXUSD', 
+                    'TRXUSD', 'REQUSD', 'LRCUSD', 'WAXUSD', 'DAIUSD', 'BFTUSD', 'ODEUSD', 'ANTUSD', 'XLMUSD', 
+                    'XVGUSD', 'MKRUSD', 'KNCUSD', 'LYMUSD', 'UTKUSD', 'VEEUSD', 'ESSUSD', 'IQXUSD', 'ZILUSD', 
+                    'BNTUSD', 'XRAUSD', 'VETUSD', 'GOTUSD', 'XTZUSD', 'MLNUSD', 'PNKUSD', 'DGBUSD', 'BSVUSD', 
+                    'ENJUSD', 'PAXUSD']
+        self.pairs = [Pair(self, ticker, self.minimumVolume) for ticker in universe]
+
+        self.SetBenchmark(self.AddCrypto('BTCUSD', Resolution.Daily, Market.Bitfinex).Symbol)  
+        
+        self.SetWarmup(30)
+        self.Debug("Initialization complete")
+
+    def OnData(self, data):
+        if self.IsWarmingUp:
+            return
+
+        for pair in self.pairs:
+            if not pair.rsi.IsReady:
+                self.Debug(f"{pair.symbol} RSI not ready")
+                continue
+
+            symbol = pair.symbol
+            rsi = pair.rsi.Current.Value
+            investable = pair.Investable()
+
+            # Ensure higher highs condition is met
+            if not pair.higher_high:
+                self.Debug(f"Skipping {symbol}: No higher high detected.")
+                continue
+
+            rsi_decreasing = pair.previous_rsi is not None and rsi < pair.previous_rsi
+            rsi_increasing = pair.previous_rsi is not None and rsi > pair.previous_rsi
+            pair.previous_rsi = rsi
+
+            if not investable:
+                self.Debug(f"{symbol} is not investable due to volume constraint")
+                continue
+
+            # Buying logic
+            if rsi_increasing and rsi > self.momentum_entry and rsi < self.overbought_exit and self.Portfolio.MarginRemaining > self.positionSizeUSD:
+                self.Debug(f"Buying {symbol}: RSI approaching momentum_entry (bullish). RSI={rsi}, Price={self.Securities[symbol].Price}")
+                self.Buy(symbol, self.positionSizeUSD / self.Securities[symbol].Price)
+
+            elif rsi_decreasing and rsi < self.oversold_entry and self.Portfolio.MarginRemaining > self.positionSizeUSD:
+                self.Debug(f"Buying {symbol}: RSI approaching oversold_entry (bearish). RSI={rsi}, Price={self.Securities[symbol].Price}")
+                self.Buy(symbol, self.positionSizeUSD / self.Securities[symbol].Price)
+
+            # Liquidation logic
+            if self.Portfolio[symbol].Invested:
+                if not investable:
+                    self.Debug(f"Liquidating {symbol} due to volume constraint")
+                    self.Liquidate(symbol, "Not enough volume")
+                elif rsi > self.overbought_exit and rsi_increasing:
+                    self.Debug(f"Liquidating {symbol}: RSI above overbought_exit (bullish). RSI={rsi}")
+                    self.Liquidate(symbol, "RSI above overbought")
+                elif rsi < self.momentum_exit and rsi_decreasing:
+                    self.Debug(f"Liquidating {symbol}: RSI below momentum_exit (bearish). RSI={rsi}")
+                    self.Liquidate(symbol, "RSI below momentum_exit")
+
+
+class Pair:
+    def __init__(self, algorithm, ticker, minimumVolume): 
+        self.algorithm = algorithm
+        self.symbol = algorithm.AddCrypto(ticker, Resolution.Daily, Market.Bitfinex).Symbol
+
+        # Ensure RSI is properly initialized
+        self.rsi = algorithm.RSI(self.symbol, 14, MovingAverageType.Simple, Resolution.Daily)
+        
+        # Simplified volume calculation for stability
+        self.volume = algorithm.SMA(self.symbol, 30, Resolution.Daily, Field.Volume)
+        
+        self.minimumVolume = minimumVolume
+        self.previous_rsi = None
+
+        # Biweekly consolidator setup
+        self.biweekly_consolidator = TradeBarConsolidator(timedelta(days=14))
+        algorithm.SubscriptionManager.AddConsolidator(self.symbol, self.biweekly_consolidator)
+        self.biweekly_consolidator.DataConsolidated += self.OnBiweeklyBar
+        self.current_biweek = {"high": None}
+        self.previous_biweek = {"high": None}
+        self.higher_high = False
+    
+    def OnBiweeklyBar(self, sender, bar):
+        # Check for valid high prices
+        if bar.High is not None:
+            self.previous_biweek = self.current_biweek.copy()
+            self.current_biweek["high"] = bar.High
+
+        # Check for higher highs
+        if self.previous_biweek["high"] is not None:
+            self.higher_high = self.current_biweek["high"] > self.previous_biweek["high"]
+            
+            if self.higher_high:
+                self.algorithm.Debug(f"Higher high detected for {self.symbol}: {self.current_biweek['high']}")
+    
+    def Investable(self):
+        # Ensure indicators are ready
+        if not self.volume.IsReady or not self.rsi.IsReady:
+            return False
+        return self.volume.Current.Value > self.minimumVolume
