@@ -1,0 +1,139 @@
+#region imports
+from AlgorithmImports import *
+#endregion
+
+class DiversifiedTradingStrategy(QCAlgorithm):
+
+    def Initialize(self):
+        self.SetStartDate(2023, 1, 1)
+        self.SetCash(1000000)
+        
+        self.Settings.FreePortfolioValuePercentage = 0.05
+        self.positionSizePercent = 0.25  # Allocate 25% to each class
+        self.momentum_entry = 60
+        self.oversold_entry = 20
+        self.momentum_exit = 40
+        self.overbought_exit = 80
+        self.minimumVolume = 50000
+
+        # Define universes
+        self.crypto_universe = ['BTCUSD', 'LTCUSD', 'ETHUSD', 'ETCUSD', 'RRTUSD', 'ZECUSD', 'XMRUSD', 'XRPUSD', 'EOSUSD', 
+                    'SANUSD', 'OMGUSD', 'NEOUSD', 'ETPUSD', 'BTGUSD', 'SNTUSD', 'BATUSD', 'FUNUSD', 'ZRXUSD', 
+                    'TRXUSD', 'REQUSD', 'LRCUSD', 'WAXUSD', 'DAIUSD', 'BFTUSD', 'ODEUSD', 'ANTUSD', 'XLMUSD', 
+                    'XVGUSD', 'MKRUSD', 'KNCUSD', 'LYMUSD', 'UTKUSD', 'VEEUSD', 'ESSUSD', 'IQXUSD', 'ZILUSD', 
+                    'BNTUSD', 'XRAUSD', 'VETUSD', 'GOTUSD', 'XTZUSD', 'MLNUSD', 'PNKUSD', 'DGBUSD', 'BSVUSD', 
+                    'ENJUSD', 'PAXUSD']
+        self.stock_universe = ['AAPL', 'MSFT', 'GOOG', "TSLA", "NVDA", "META", "COIN", "GOOG", "SAVA", "OXY", "CHGG", "AMD",
+                    "PALAF", "SOFI", "AWZN", "AZO", "CHWY", "ETSY", "MGM", "JPM", "MA", "XOM", "BKR",
+                    "NEE", "IART", "HEI", "HWM", "SBGSF", "ECL", "NFLX", "TSN", "VST", "CEG", "PLNT",
+                    "CRM", "NOW"]
+        self.index_universe = ['DODFX', 'ACMVX', 'PRFHX', 'VOOG', 'SCHG', 'VGT', 'SCHD', 'SDY', 'VYM', 'FCNTX', 'AGTHX',
+                    'TRBCX', 'VTWAX', 'VCLT', 'VEXAX', 'FTIHX', 'VBR', 'FSENX', 'FSPCX', 'FMILX']
+        self.commodities_universe = ['CL', 'NG', 'GC', 'SI', 'HG', 'AL', 'PL', 'PA', 'ZC', 'ZW', 'ZS', 'KC', 'SB', 'CT',
+                    'CC', 'RR', 'O', 'LB', 'RU', 'EH', 'LC', 'LH', 'FC', 'OJ', 'WO', 'CA', 'NI', 'ZI', 'LD', 'TN']
+
+        self.pairs = []
+        self.AddUniverse(self.crypto_universe, self.AddCrypto, "Crypto")
+        self.AddUniverse(self.stock_universe, self.AddEquity, "Stock")
+        self.AddUniverse(self.index_universe, self.AddEquity, "Index")
+        self.AddUniverse(self.commodities_universe, self.AddEquity, "Commodity")
+
+        self.SetBenchmark(self.AddEquity('SPY').Symbol)
+        self.SetWarmup(30)
+        self.Debug("Initialization complete")
+
+    def AddUniverse(self, universe, addMethod, universeName):
+        for ticker in universe:
+            try:
+                pair = Pair(self, addMethod(ticker).Symbol, self.minimumVolume, universeName)
+                self.pairs.append(pair)
+                self.Debug(f"Added {ticker} to {universeName} universe")
+            except Exception as e:
+                self.Debug(f"Failed to add {ticker} to {universeName} universe: {str(e)}")
+
+
+    def OnData(self, data):
+        if self.IsWarmingUp:
+            return
+
+        allocation_per_class = self.Portfolio.TotalPortfolioValue * self.positionSizePercent
+
+        # Track allocation by asset class
+        class_allocations = {"Crypto": 0, "Stock": 0, "Index": 0, "Commodity": 0}
+
+        for pair in self.pairs:
+            if not pair.rsi.IsReady or not pair.Investable():
+                continue
+
+            symbol = pair.symbol
+            rsi = pair.rsi.Current.Value
+            universe_name = pair.universe_name
+
+            if not pair.higher_high:
+                continue
+
+            rsi_decreasing = pair.previous_rsi is not None and rsi < pair.previous_rsi
+            rsi_increasing = pair.previous_rsi is not None and rsi > pair.previous_rsi
+            pair.previous_rsi = rsi
+
+            # Buying logic
+            if class_allocations[universe_name] < allocation_per_class:
+                if rsi_increasing and rsi > self.momentum_entry and rsi < self.overbought_exit:
+                    allocation = allocation_per_class - class_allocations[universe_name]
+                    quantity = allocation / self.Securities[symbol].Price
+                    self.Buy(symbol, quantity)
+                    class_allocations[universe_name] += allocation
+                
+                elif rsi_decreasing and rsi < self.oversold_entry:
+                    allocation = allocation_per_class - class_allocations[universe_name]
+                    quantity = allocation / self.Securities[symbol].Price
+                    self.Buy(symbol, quantity)
+                    class_allocations[universe_name] += allocation
+
+            # Liquidation logic
+            if self.Portfolio[symbol].Invested:
+                if rsi > self.overbought_exit and rsi_increasing:
+                    self.Liquidate(symbol)
+                elif rsi < self.momentum_exit and rsi_decreasing:
+                    self.Liquidate(symbol)
+
+class Pair:
+    def __init__(self, algorithm, symbol, minimumVolume, universe_name=None):
+        self.algorithm = algorithm
+        self.symbol = symbol
+        self.universe_name = universe_name
+        self.minimumVolume = minimumVolume
+        self.rsi = algorithm.RSI(self.symbol, 14, MovingAverageType.Simple, Resolution.Daily)
+        self.volume = algorithm.SMA(self.symbol, 30, Resolution.Daily, Field.Volume)
+        self.previous_rsi = None
+
+        # Biweekly consolidator setup
+        self.biweekly_consolidator = TradeBarConsolidator(timedelta(days=14))
+        algorithm.SubscriptionManager.AddConsolidator(self.symbol, self.biweekly_consolidator)
+        self.biweekly_consolidator.DataConsolidated += self.OnBiweeklyBar
+        self.current_biweek = {"high": None, "low" : None}
+        self.previous_biweek = {"high": None, "low" : None}
+        self.higher_high = False
+        self.lower_low = False
+    
+    def OnBiweeklyBar(self, sender, bar):
+        # Check for valid high prices
+        if bar.High is not None and bar.Low is not None:
+            self.previous_biweek = self.current_biweek.copy()
+            self.current_biweek["high"] = bar.High
+            self.current_biweek["low"] = bar.Low
+
+        # Check for higher highs
+        if self.previous_biweek["high"] is not None:
+            self.higher_high = self.current_biweek["high"] > self.previous_biweek["high"]
+            self.lower_low = self.current_biweek["low"] < self.previous_biweek["low"]
+            if self.higher_high:
+                self.algorithm.Debug(f"Higher high detected for {self.symbol}: {self.current_biweek['high']}")
+            if self.lower_low:
+                self.algorithm.Debug(f"Lower low detected for {self.symbol}: {self.current_biweek['low']}")
+
+    def Investable(self):
+        # Ensure indicators are ready
+        if not self.volume.IsReady or not self.rsi.IsReady:
+            return False
+        return self.volume.Current.Value > self.minimumVolume
